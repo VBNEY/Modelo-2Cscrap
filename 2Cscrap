@@ -1,0 +1,751 @@
+# TODO: Add comment
+# 
+# Author: Vitor Bogaci Ney 25/08/2019
+###############################################################################
+memory.limit(size = 2500)
+library(mise)
+print('teste')
+mise()
+plot('x')
+gc()
+rm(list = ls())
+
+library(caret)
+library(dplyr)
+library(randomForest)
+library(ROCR)
+set.seed(123)
+
+undersampling_byclusters<-function(x,TARGET=c(),exclude_feature=c(),groupby=5,n_balance=600,N_max_group=60,noise_filter=c(0.025,0.975),seed=1,decimal_places=5,add_idsample=F,rm_bychsquare_anova=T,rm_byIV=F,rm_outliers=F){
+  
+  rename_columns<-function(df,caracteres=c('.',',',';',' ','~','*','[',']','{','}','(',')','&')){
+    for (i in 1:NCOL(df)){for(j in caracteres){names(df)[i]<-gsub(paste0("\\",j),"",names(df)[i])}}
+    return(df)}
+  dtini<-Sys.time()
+  
+  dataset_temp<-x
+  dataset_temp$cluster_principal<-''
+  dataset_temp<-rename_columns(dataset_temp)
+  
+  if(sum(is.na(dataset_temp))>0){
+    stop("There are some missing data, please solve this issue and execute the function again...")
+    return(dataset_temp)}
+  
+  
+  #verifica se a variável TARGET é dummy(classificação)
+  if(length(TARGET)==0){
+    perce_original <- c()
+  }else{
+    if(((NROW(dataset_temp[dataset_temp[,TARGET]==0,])+NROW(dataset_temp[dataset_temp[,TARGET]==1,]))==NROW(dataset_temp))){
+      perce_original <- NROW(dataset_temp[dataset_temp[,TARGET]==1,])/NROW(dataset_temp)
+    }else{
+      perce_original <- c()}}
+  
+  #identifica colunas iniciais, as numéricas, remove as não desejadas definidas 
+  colunas_iniciais<-colnames(dataset_temp)
+  dataset_temp$cluster<-''
+  colunas_numericas <- colnames(dataset_temp[,unlist(lapply(dataset_temp, is.numeric))])
+  colunas_numericas <- setdiff(colunas_numericas,exclude_feature)
+  
+  if(is.numeric(groupby)){
+    groupby_temp<-c()
+    for(coluna_num in colunas_numericas){
+      txt<-paste0(coluna_num , ';' , groupby)
+      groupby_temp<-c(groupby_temp,txt)
+    }
+    groupby<-groupby_temp}
+  print(groupby)
+  
+  
+  #Apenas para fazer um print dos clusters gerados individualmente
+  itemp<-1
+  for (coluna in groupby){		
+    #se separado com ; existe o número de cluster definido
+    ncluster_definido<-unlist(strsplit(coluna,';'))[2]
+    n_clusters<-as.numeric(ncluster_definido)
+    coluna<-unlist(strsplit(coluna,';'))[1]		
+    
+    print(coluna)
+    mydata <- scale(round(dataset_temp[,coluna,drop=FALSE],decimal_places))
+    
+    set.seed(seed)
+    n_clusters<-apply(mydata, 2, function(x) ifelse(length(unique(x))>=n_clusters,n_clusters,length(unique(x))))
+    gc()
+    datasetCluster <- kmeans(mydata, centers = n_clusters, iter.max = 50, nstart = 17,algorithm = c("Hartigan-Wong"))
+    dataset_temp$cluster_temp<-paste(coluna,"."	,datasetCluster$cluster,";", sep="")
+    dataset_temp$cluster <- paste(dataset_temp$cluster, dataset_temp$cluster_temp, sep="")
+    
+    if((coluna %in% colunas_numericas)){
+      formula_aggregate<- as.formula(paste("cbind(",TARGET,",",coluna,") ~ cluster_temp"))
+      detalhe_cluster<- aggregate(formula_aggregate, data=dataset_temp,FUN= {function(x) c(avg=mean(x), sd=sd(x), count=length(x),min=min(x),max=max(x),sum=sum(x))})
+      detalhe_cluster<-data.frame(cluster=detalhe_cluster$cluster_temp,avg=format(round(detalhe_cluster[,coluna][,1], decimal_places), nsmall = decimal_places),sd=format(round(detalhe_cluster[,coluna][,2], decimal_places), nsmall = decimal_places),qtde=detalhe_cluster[,coluna][,3],
+                                  min_max=paste(coluna,format(round(detalhe_cluster[,coluna][,4], decimal_places), nsmall = decimal_places),'~',format(round(detalhe_cluster[,coluna][,5], decimal_places), nsmall = decimal_places),';', sep=""),
+                                  tg_avg=format(round(detalhe_cluster[,TARGET][,1], decimal_places), nsmall = decimal_places),tg_sum=detalhe_cluster[,TARGET][,6],stringsAsFactors = FALSE)
+      
+      detalhe_cluster$Variable<-coluna
+      detalhe_cluster$ClusterColumm<-paste0("V_",itemp)
+      
+      #Realizaçao do teste QuiQuadrado
+      if(length(perce_original)>0){
+        detalhe_cluster$esperado<- sum(detalhe_cluster$tg_sum)/sum(detalhe_cluster$qtde)*detalhe_cluster$qtde
+        detalhe_cluster$chiquadrado_temp<-((abs(detalhe_cluster$tg_sum-detalhe_cluster$esperado))^2)/detalhe_cluster$esperado
+        detalhe_cluster$chiquadrado<-round(sum(detalhe_cluster$chiquadrado_temp),4)
+        detalhe_cluster$chiquadrado_crit99<-round(qchisq(.99, df=(NROW(detalhe_cluster)-1)),4)
+        detalhe_cluster$P<-round(pchisq(detalhe_cluster$chiquadrado, df=(NROW(detalhe_cluster)-1), lower.tail=FALSE),4)
+        detalhe_cluster$P0<-(detalhe_cluster$qtde*(1-as.numeric(detalhe_cluster$tg_avg))+0.5)/sum(detalhe_cluster$qtde*(1-as.numeric(detalhe_cluster$tg_avg)))
+        detalhe_cluster$P1<-(detalhe_cluster$qtde*as.numeric(detalhe_cluster$tg_avg)+0.5)/sum(detalhe_cluster$qtde*as.numeric(detalhe_cluster$tg_avg))
+        detalhe_cluster$AdjustedWOE<-log(detalhe_cluster$P0/detalhe_cluster$P1)
+        detalhe_cluster$IV<-sum(detalhe_cluster$AdjustedWOE*(detalhe_cluster$P0-detalhe_cluster$P1))
+        detalhe_cluster$IV_Power<-ifelse(detalhe_cluster$IV<0.02,'Useless',ifelse(detalhe_cluster$IV<0.1,'Weak',ifelse(detalhe_cluster$IV<0.3,'Medium',ifelse(detalhe_cluster$IV<0.5,'Strong','Too good'))))
+        detalhe_cluster[,c('chiquadrado_temp','esperado','P1','P0','AdjustedWOE')]<-NULL
+        
+      }else{#regressor -> ANOVA
+        detalhe_cluster$C<- (sum(dataset_temp[,TARGET])^2)/NROW(dataset_temp)
+        detalhe_cluster$SQT<- sum(dataset_temp[,TARGET]^2)-detalhe_cluster$C
+        detalhe_cluster$SQTr<- sum((detalhe_cluster$tg_sum^2)/detalhe_cluster$qtde)-detalhe_cluster$C
+        detalhe_cluster$SQR<- detalhe_cluster$SQT-detalhe_cluster$SQTr
+        detalhe_cluster$QMTr<- detalhe_cluster$SQTr/(NROW(detalhe_cluster)-1)
+        detalhe_cluster$QMR<- detalhe_cluster$SQR/(sum(detalhe_cluster$qtde)-NROW(detalhe_cluster)-1)
+        detalhe_cluster$FSnedecor<-detalhe_cluster$QMTr/detalhe_cluster$QMR
+        detalhe_cluster$FCriticalValue<- qf(.99, df1=(NROW(detalhe_cluster)-1), df2=sum(detalhe_cluster$qtde))
+        detalhe_cluster$P<- (1-pf(mean(detalhe_cluster$FSnedecor), df1=(NROW(detalhe_cluster)-1), df2=sum(detalhe_cluster$qtde)))
+        detalhe_cluster[,c('C','SQR','SQT','SQTr','QMTr','QMR')]<-NULL
+      }
+      
+      if(!exists("acumulador_infocluster")){
+        acumulador_infocluster<-detalhe_cluster
+      }else{
+        acumulador_infocluster<-rbind(acumulador_infocluster,detalhe_cluster)}
+      
+      #se o teste quiquadrado idenficar irrelevancia, não adiciona o cluster
+      id_rm<-F
+      if(rm_bychsquare_anova==T & max(detalhe_cluster$P)>0.05){id_rm<-T}
+      
+      #remove cluster por IV
+      if(id_rm==F & rm_byIV==T){
+        if(length(perce_original)>0){
+          if(max(detalhe_cluster$IV)<0.1){
+            id_rm<-T}}}
+      
+      
+      if(id_rm==F){
+        dataset_temp[,paste0("V_",itemp)]<-paste(coluna,"."	,datasetCluster$cluster,";", sep="")
+        itemp<-itemp+1
+        dataset_temp$cluster_principal <- paste(dataset_temp$cluster_principal, dataset_temp$cluster_temp, sep="")}
+      
+    }
+    
+    gc()
+    dataset_temp$cluster_temp<-NULL	
+    rm(mydata,datasetCluster)
+    
+  }
+  if(length(perce_original)>0){print(unique(acumulador_infocluster[,c('Variable','IV_Power')]))}
+  detalhe_cluster$Variable<-NULL
+  
+  print(acumulador_infocluster)
+  
+  #Maiores e menores clusters
+  infoclustertemp<-acumulador_infocluster[,c('cluster','ClusterColumm','tg_avg')]
+  infoclustertemp$tg_avg<-as.numeric(infoclustertemp$tg_avg)
+  clusterqnt<-quantile(infoclustertemp$tg_avg,probs = c(.05,0.80))
+  special_clusters_up<-infoclustertemp[infoclustertemp$tg_avg>=clusterqnt[2],c('cluster','ClusterColumm')]
+  special_clusters_down<-infoclustertemp[infoclustertemp$tg_avg<=clusterqnt[1],c('cluster','ClusterColumm')]
+  
+  print("Special Clusters Down:")
+  print(paste0(special_clusters_down[,1]))
+  
+  print("Special Clusters UP:")
+  print(paste0(special_clusters_up[,1]))
+  
+  special_cluster<-rbind(special_clusters_up,special_clusters_down)
+  
+  itemp<-itemp-1
+  new_columns_names<-paste0("V_",seq(1:itemp))
+  dataset_temp$ID_AMOSTRA<-0
+  
+  NROW0<-NROW(dataset_temp[dataset_temp[,TARGET]==0,])
+  NROW1<-NROW(dataset_temp[dataset_temp[,TARGET]==1,])
+  dataset_temp[dataset_temp[,TARGET]==0,'rownum0']<-sample(1:NROW0, NROW0, replace=FALSE)
+  dataset_temp[dataset_temp[,TARGET]==0 & dataset_temp[,'rownum0']<=NROW1,'ID_AMOSTRA']<-1
+  dataset_temp[dataset_temp[,TARGET]==1,'ID_AMOSTRA']<-1
+  dataset_temp[,'rownum0']<-NULL
+  
+  if(length(perce_original)>0){
+    print("Proporcao original...")
+    print(cbind(freq=table(dataset_temp[,TARGET]), perc=prop.table(table(dataset_temp[,TARGET]))*100))}
+  
+  if(length(perce_original)>0){
+    print("Após selecao randomizada simples e balanceada...")
+    print(cbind(freq=table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]), perc=prop.table(table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]))*100))}
+  
+  #Amostragem nos clusters criados, aproveitando amostras já selecionadas
+  for(i in new_columns_names){
+    qtde_groupby<- aggregate(as.formula(paste(TARGET, "~", i)), data=dataset_temp,FUN=length)
+    vetor_groupby<- qtde_groupby[order(qtde_groupby[,2]),1]
+    
+    for (j in vetor_groupby){
+      print(j)
+      vetor0<-dataset_temp[,i]==j
+      
+      #combina as colunas mais relevantes para amostrar 2 a 2
+      if(length(special_cluster[special_cluster[,1]==j,1])==1 & length(perce_original)>0){
+        for(cluster_combinado in special_cluster[,1]){
+          coluna_cluster<-unique(special_cluster[special_cluster[,1]==cluster_combinado,2]) #verifica em qual columa está e deixa apenas 1 registro
+          vetor_temp_nao_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']==0 & dataset_temp[vetor0,coluna_cluster]==cluster_combinado
+          vetor_temp_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']>0 & dataset_temp[vetor0,coluna_cluster]==cluster_combinado
+          NROW_LOOP0<-sum(vetor_temp_nao_amostrado)
+          NROW_LOOP1<-sum(vetor_temp_amostrado)
+          dataset_temp[vetor_temp_nao_amostrado,'rownum0']<-sample(1:NROW_LOOP0, NROW_LOOP0, replace=FALSE)
+          vetor_rownum<-vetor_temp_nao_amostrado & dataset_temp[,'rownum0']<=(n_balance*0.1-NROW_LOOP1)
+          soma_rownum<-sum(vetor_rownum)
+          dataset_temp[vetor_rownum,'ID_AMOSTRA']<-sample(soma_rownum:1/soma_rownum)
+        }
+      }
+      
+      NROW_LOOP<-NROW(dataset_temp[vetor0,])
+      n_balance_loop<-ifelse(n_balance>NROW_LOOP,NROW_LOOP,n_balance)
+      vetor_temp_nao_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']==0
+      NROW_LOOP0<-sum(vetor_temp_nao_amostrado)
+      NROW_LOOP1<-sum(vetor0 & dataset_temp[,'ID_AMOSTRA']>0)
+      dataset_temp[vetor_temp_nao_amostrado,'rownum0']<-sample(1:NROW_LOOP0, NROW_LOOP0, replace=FALSE)
+      
+      if(NROW_LOOP1<n_balance_loop){
+        vetor_rownum<-vetor_temp_nao_amostrado & dataset_temp[,'rownum0']<=(n_balance_loop-NROW_LOOP1)
+        soma_rownum<-sum(vetor_rownum)
+        dataset_temp[vetor_rownum,'ID_AMOSTRA']<-sample(soma_rownum:1/soma_rownum)}
+      else{
+        #garante a retirada de pelo menos 3 amostras em uma região abaixo das obtidas nas recicladas
+        coluna<-read.table(text = j, sep = ".", colClasses = "character",stringsAsFactors=F)
+        coluna<-coluna[,1]
+        vetor_temp_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']>0
+        qnt <-quantile(dataset_temp[vetor_temp_amostrado,coluna],probs=c(0,1),na.rm=TRUE)
+        
+        for(index_percentil in 1:2){
+          if(index_percentil==1){
+            vetor_temp_nao_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']==0 & dataset_temp[vetor0,coluna]<qnt[index_percentil]
+          }else{
+            vetor_temp_nao_amostrado<-vetor0 & dataset_temp[,'ID_AMOSTRA']==0 & dataset_temp[vetor0,coluna]>qnt[index_percentil]}
+          NROW_LOOP0<-sum(vetor_temp_nao_amostrado)
+          dataset_temp[vetor_temp_nao_amostrado,'rownum0']<-sample(1:NROW_LOOP0, NROW_LOOP0, replace=FALSE)
+          vetor_rownum<-vetor_temp_nao_amostrado & dataset_temp[,'rownum0']<=3
+          soma_rownum<-sum(vetor_rownum)
+          dataset_temp[vetor_rownum,'ID_AMOSTRA']<-sample(soma_rownum:1/soma_rownum)}
+      }
+    }		
+  }
+  
+  if(rm_outliers==T){
+    #tramento para remocao de outliers
+    print("Removendo outliers...")
+    for(i in new_columns_names){
+      qtde_groupby<- aggregate(as.formula(paste(TARGET, "~", i)), data=dataset_temp,FUN=length)
+      vetor_groupby<- qtde_groupby[order(qtde_groupby[,2]),1]
+      for (j in vetor_groupby){
+        vetor0<-dataset_temp[,i]==j
+        coluna<-read.table(text = j, sep = ".", colClasses = "character",stringsAsFactors=F)
+        coluna<-coluna[,1]
+        qnt <-quantile(dataset_temp[vetor0,coluna],probs=c(0,0.25,0.75,1),na.rm=TRUE)
+        min_max_geral <-quantile(dataset_temp[,coluna],probs=c(0,1),na.rm=TRUE)
+        media_temp<-mean(dataset_temp[vetor0,coluna])
+        desvio_temp<-sd(dataset_temp[vetor0,coluna])
+        H <- (qnt[3]-qnt[2])*3
+        if(min_max_geral[1]==qnt[1] ){#somente se for no menor  cluster 
+          dataset_temp[dataset_temp[,coluna]<(qnt[2]-H) & dataset_temp[,coluna]<(media_temp-6*desvio_temp),'ID_AMOSTRA']<-0}
+        if(min_max_geral[2]==qnt[4]){#somente se for no maior cluster 
+          dataset_temp[dataset_temp[,coluna]>(qnt[3]+H) & dataset_temp[,coluna]>(media_temp+6*desvio_temp),'ID_AMOSTRA']<-0}
+      }		
+    }
+  }
+  
+  rm(vetor_rownum,vetor0)
+  dataset_temp[dataset_temp[,TARGET]==1,'ID_AMOSTRA']<-1
+  dataset_temp$cluster_temp<-NULL
+  
+  if(length(perce_original)>0){
+    print("Após amostragem clusterizada...")
+    print(cbind(freq=table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]), perc=prop.table(table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]))*100))}
+  
+  
+  #Utilizado para pegar combinação dos cluster com poucos dados, utilizado um pouco antes da final da função 
+  df_cluster<- aggregate(as.formula(paste("cbind(",TARGET,",ID_AMOSTRA) ~ cluster_principal")),data=dataset_temp,FUN={function(x) c(count=length(x),avg=mean(x),soma=sum(ifelse(x>0,1,0)))})
+  df_cluster<- data.frame(cluster_principal=df_cluster$cluster_principal,count=df_cluster[,TARGET][,1],avg=df_cluster[,TARGET][,2],sum_sample=df_cluster[,"ID_AMOSTRA"][,3],stringsAsFactors=FALSE)
+  qtde_clusters<-NROW(df_cluster)
+  df_cluster$cluster_simples<-1:qtde_clusters #mudança da chave complexa do cluster para um número mais simples
+  dataset_temp<-merge(dataset_temp,df_cluster)
+  #print(df_cluster[order(-df_cluster[,'sum_sample']),])
+  print(paste0(qtde_clusters," clusters combinados"))
+  
+  
+  #aplicaçao da agregação identificada acima para pegar N_max_group amostras
+  if(length(perce_original)>0){
+    vetor_redundancia<-df_cluster[df_cluster[,'sum_sample']>N_max_group & df_cluster[,3]<=noise_filter[1],'cluster_simples'] #classificador
+  }else{
+    vetor_redundancia<-df_cluster[df_cluster[,'sum_sample']>N_max_group,'cluster_simples']} #regressor
+  
+  for(cluster_loop in vetor_redundancia){
+    
+    if(length(perce_original)>0){
+      vetor_n_amostra<-dataset_temp[,'cluster_simples'] == cluster_loop & dataset_temp[,'ID_AMOSTRA']>0 & dataset_temp[,TARGET] == 0
+    }else{
+      vetor_n_amostra<-dataset_temp[,'cluster_simples'] == cluster_loop & dataset_temp[,'ID_AMOSTRA']>0}
+    n_amostra<-sum(vetor_n_amostra)
+    
+    dataset_temp[vetor_n_amostra,'rownumber']<-sample(1:n_amostra, n_amostra, replace=FALSE)
+    dataset_temp[vetor_n_amostra & dataset_temp[,'rownumber']>N_max_group,'ID_AMOSTRA']<-0
+    
+    #correcao do já que algumas amostras foram excluidas
+    if(length(perce_original)>0){
+      vetor_n_amostra<-dataset_temp[,'cluster_simples'] == cluster_loop & dataset_temp[,'ID_AMOSTRA']>0 & dataset_temp[,TARGET] == 0
+    }else{
+      vetor_n_amostra<-dataset_temp[,'cluster_simples'] == cluster_loop & dataset_temp[,'ID_AMOSTRA']>0}
+    soma_n_amostra<-sum(vetor_n_amostra)
+    dataset_temp[vetor_n_amostra,'ID_AMOSTRA']<-(soma_n_amostra:1)/soma_n_amostra
+    rm(vetor_n_amostra)
+    
+  }
+  rm(vetor_redundancia)
+  
+  if(length(perce_original)>0){
+    print("Após eliminação de redundância e possível incremento de registros...")
+    print(cbind(freq=table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]), perc=prop.table(table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]))*100))}
+  
+  #limpar ruido
+  if(length(perce_original)>0){
+    
+    if(mean(df_cluster[df_cluster[,3]>0,3])>noise_filter[1]){#Somente se a média de defeito dos clusters que o tiveram forem acima do ruído, então aplicar o noise reduction inferior, 
+      #noise reduction LOW
+      for(cluster_loop in df_cluster[df_cluster[,3]>0 & df_cluster[,3]<=noise_filter[1],1]){
+        dataset_temp[dataset_temp[,'cluster_principal'] == cluster_loop & dataset_temp[,TARGET]==1,'ID_AMOSTRA']<-0}
+      
+      print("Após eliminacao ruidos em grupos predominantemente sem defeitos")
+      print(cbind(freq=table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]), perc=prop.table(table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]))*100))}
+    
+    #noise reduction high
+    for(cluster_loop in df_cluster[df_cluster[,3]>=noise_filter[2],1]){
+      dataset_temp[dataset_temp[,'cluster_principal'] == cluster_loop & dataset_temp[,TARGET]==0,'ID_AMOSTRA']<-0}
+    
+    print("Após eliminacao ruidos em grupos predominantemente com defeitos")
+    print(cbind(freq=table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]), perc=prop.table(table(dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,TARGET]))*100))
+  }
+  rm(df_cluster)
+  
+  if(add_idsample==T){colunas_iniciais<-c(colunas_iniciais,'ID_AMOSTRA')}
+  dataset_temp<-dataset_temp[dataset_temp[,'ID_AMOSTRA']>0,]
+  dataset_temp$ID_AMOSTRA<-(1-dataset_temp$ID_AMOSTRA)
+  
+  dataset_temp<-dataset_temp[,colunas_iniciais]
+  dataset_temp <-dataset_temp[,c(setdiff(colnames(dataset_temp),TARGET),TARGET)]
+  print(paste0(dtini,' ~ ',Sys.time()))
+  
+  #identifica colunas com dados identicos(zerovar)
+  foo <- function(dat) {
+    out <- lapply(dat, function(x) length(unique(x)))
+    want <- which(!out > 1)
+    unlist(want)
+  }
+  zerovar<-names(foo(dataset_temp))
+  colunas_uteis<-setdiff(colunas_iniciais,zerovar)
+  dataset_temp<-dataset_temp[,colunas_uteis]
+  
+  print(dim(dataset_temp))
+  dtfim<-Sys.time()
+  tempo_processamento <-paste0('Start in:', dtini,', Finish in:',dtfim)
+  print(tempo_processamento)
+  return(dataset_temp)	
+}
+outliers_md<-function(dataset,n_cluster=3,colunas=c(),nome=c('id_outliers'),multiplicador_outlier=3,retorna=c('all')){
+  
+  if(retorna=='all'){
+    nomes_que_seguem<-c(colnames(dataset),nome,'cluster')
+  }else{
+    nomes_que_seguem<-c(colunas,'cluster')
+  }
+  
+  
+  datasetCluster <- kmeans(scale(dataset[,colunas]), centers = n_cluster, iter.max = 25, nstart = 21,algorithm = c("Hartigan-Wong"))
+  dist<-sqrt(rowSums(scale(dataset[,colunas]) - fitted(datasetCluster)) ^ 2)
+  
+  dataset$cluster<-datasetCluster$cluster
+  dataset$dist<-dist
+  dataset[,nome]<-0
+  
+  limite<-aggregate(as.formula("dist~cluster"),data=dataset,FUN={function(x)c(LIC=quantile(x,0.25)-IQR(x)*1.5*multiplicador_outlier,LSC=quantile(x,0.75)+IQR(x)*1.5*multiplicador_outlier)})
+  detalhe_cluster<-data.frame(cluster=limite$cluster,IC_INF1=limite[,2][,1],IC_SUP1=limite[,2][,2],stringsAsFactors=FALSE)
+  dataset<-merge(dataset,detalhe_cluster)	
+  dataset[dataset$dist>=dataset$IC_SUP1 | dataset$dist<=dataset$IC_INF1,nome]<-1
+  print(dataset[dataset[,nome]==1,nomes_que_seguem])
+  return(dataset[,nomes_que_seguem])
+}
+nfold_check<-function(y_test,y_model_prob,infoextra=c(),infoextra2=c()){
+  df<-data.frame(ytest =y_test,yprobpred=y_model_prob )
+  df<-df[sample(nrow(df)),]	
+  print(infoextra)
+  print(infoextra2)
+  
+  
+  set.seed(123)
+  p<-2.5
+  n1<-1
+  tabela_resumo <- data.frame(P=0,T0M0=0,T1M1=0,T1M0=0,T0M1=0)
+  while (p<=99){
+    tabela_resumo[n1,"P"]<-p/100
+    tabela_resumo[n1,"T1M1"]<-NROW(df[df$yprobpred>=p/100 & df$ytest==1,])
+    tabela_resumo[n1,"T1M0"]<-NROW(df[df$yprobpred<p/100 & df$ytest==1,])
+    tabela_resumo[n1,"T0M0"]<-NROW(df[df$yprobpred<p/100 & df$ytest==0,])
+    tabela_resumo[n1,"T0M1"]<-NROW(df[df$yprobpred>=p/100 & df$ytest==0,])
+    n1<-n1+1
+    p<-p+2.5
+  }
+  
+  tabela_resumo$recall<- tabela_resumo$T1M1/(tabela_resumo$T1M1+tabela_resumo$T1M0)
+  tabela_resumo$precision<- tabela_resumo$T1M1/(tabela_resumo$T1M1+tabela_resumo$T0M1)
+  tabela_resumo$F1<- 2*(tabela_resumo$precision*tabela_resumo$recall)/(tabela_resumo$recall+tabela_resumo$precision)
+  tabela_resumo$acuracia<-(tabela_resumo$T1M1+tabela_resumo$T0M0)/(tabela_resumo$T1M1+tabela_resumo$T0M0+tabela_resumo$T1M0+tabela_resumo$T0M1)
+  tabela_resumo$abserrordif<-abs(tabela_resumo$T0M1-tabela_resumo$T1M0)
+  
+  plot(tabela_resumo[,c(1,9)])
+  points(tabela_resumo[,c('P','recall')],col="green")
+  points(tabela_resumo[,c('P','F1')],col="red")
+  points(tabela_resumo[,c('P','precision')],col="blue")
+  points(tabela_resumo[,c('P','acuracia')],col="yellow")
+  
+  cutoff_indicado<-mean(tabela_resumo[tabela_resumo[,8]==max(tabela_resumo[,8]),1])
+  cutoff_indicado1<-mean(tabela_resumo[tabela_resumo[,9]==max(tabela_resumo[,9]),1])
+  cutoff_indicado2<-mean(tabela_resumo[tabela_resumo[,10]==min(tabela_resumo[,10]),1])
+  cutoff_indicado3<-(cutoff_indicado+cutoff_indicado1+cutoff_indicado2)/3
+  
+  for(cutoff_uso in c(cutoff_indicado,cutoff_indicado1,cutoff_indicado2,cutoff_indicado3)){
+    
+    if(cutoff_indicado==cutoff_uso){
+      print(paste('Cutoff indicado (F1 Máximo): ',cutoff_uso))
+    }else{
+      if(cutoff_indicado1==cutoff_uso){
+        print(paste('Cutoff indicado (Acurácia Máxima): ',cutoff_uso))
+      }else{
+        if(cutoff_indicado2==cutoff_uso){
+          print(paste('Cutoff indicado (Balanceado): ',cutoff_uso))
+        }else{
+          print(paste('Cutoff indicado (avg geral): ',cutoff_uso))
+        }
+      }
+    }
+    
+    Union_table<-data.frame(TARGET =df$ytest,PRED_DEF=ifelse(df$yprobpred>=cutoff_uso,1,0) )
+    print(prop.table(table(Union_table[,c('TARGET','PRED_DEF')]))*100)
+    
+    tabela_resumo <- data.frame(n=0,T0M0=0,T1M1=0,T1M0=0,T0M1=0)
+    folds <- cut(seq(1,nrow(df)),breaks=10,labels=FALSE)	
+    #Perform 10 fold cross validation
+    for(i in 1:10){
+      #Segment your data by fold using the which() function 
+      testIndexes <- which(folds==i,arr.ind=TRUE)
+      df_temp<-df[testIndexes,]
+      
+      tabela_resumo[i,"n"]<-i
+      tabela_resumo[i,"T1M1"]<-NROW(df_temp[df_temp$yprobpred>=cutoff_uso & df_temp$ytest==1,])
+      tabela_resumo[i,"T1M0"]<-NROW(df_temp[df_temp$yprobpred<cutoff_uso & df_temp$ytest==1,])
+      tabela_resumo[i,"T0M0"]<-NROW(df_temp[df_temp$yprobpred<cutoff_uso & df_temp$ytest==0,])
+      tabela_resumo[i,"T0M1"]<-NROW(df_temp[df_temp$yprobpred>=cutoff_uso & df_temp$ytest==0,])
+    }
+    
+    tabela_resumo$recall<- tabela_resumo$T1M1/(tabela_resumo$T1M1+tabela_resumo$T1M0)
+    tabela_resumo$precision<- tabela_resumo$T1M1/(tabela_resumo$T1M1+tabela_resumo$T0M1)
+    tabela_resumo$F1<- 2*(tabela_resumo$precision*tabela_resumo$recall)/(tabela_resumo$recall+tabela_resumo$precision)
+    tabela_resumo$Acuracia<-(tabela_resumo$T1M1+tabela_resumo$T0M0)/(tabela_resumo$T1M1+tabela_resumo$T0M0+tabela_resumo$T1M0+tabela_resumo$T0M1)
+    tabela_resumo<-tabela_resumo[,c("n","Acuracia","F1","recall","precision")]
+    
+    tabela_resumo[11,1]<-'Mean'
+    tabela_resumo[11,2]<-mean(tabela_resumo[1:10,2])
+    tabela_resumo[11,3]<-mean(tabela_resumo[1:10,3])
+    tabela_resumo[11,4]<-mean(tabela_resumo[1:10,4])
+    tabela_resumo[11,5]<-mean(tabela_resumo[1:10,5])
+    tabela_resumo[12,1]<-'sd'
+    tabela_resumo[12,2]<-sd(tabela_resumo[1:10,2])
+    tabela_resumo[12,3]<-sd(tabela_resumo[1:10,3])
+    tabela_resumo[12,4]<-sd(tabela_resumo[1:10,4])
+    tabela_resumo[12,5]<-sd(tabela_resumo[1:10,5])
+    print(tabela_resumo)
+  }
+  
+}
+
+#Carregando a base dados
+BD ='D:\\MaterialWIP_qlik.csv' 
+data_set <- read.table(file = BD, header = TRUE, sep=';',dec = ".", stringsAsFactors = FALSE)
+
+
+TARGET=c('CD_CLASS_GQB_PLACA')
+aggregate(Laminada~CD_CLASS_GQB_PLACA,data=data_set,FUN=length)
+data_set<-data_set[data_set$CD_CLASS_GQB_PLACA!='01-WIP' &  data_set$CD_CLASS_GQB_PLACA!='00-WAITING DECISION',]
+data_set<-data_set[data_set$Year.DT_GQB_PLACA_CAL.GQB_PLACA>=2015,]
+
+#O nome daVariável de interesse vai para a variável TARGET
+data_set[,TARGET] = ifelse(data_set[,TARGET]=='03-PRIME(OTHER FIRST CHOICE)' | data_set[,TARGET]=='03-PRIME(OTHER FIRST CHOICE(STOCK))' , 0, 1)
+cbind(freq=table(data_set[,TARGET]), perc=prop.table(table(data_set[,TARGET]))*100)
+
+
+data_set[,5]<-NULL
+names(data_set)[names(data_set) == "pc_anq_elq_c"] <- "C"
+names(data_set)[names(data_set) == "pc_anq_elq_mn"] <- "Mn"
+names(data_set)[names(data_set) == "pc_anq_elq_si"] <- "Si"
+names(data_set)[names(data_set) == "pc_anq_elq_s"] <- "S"
+names(data_set)[names(data_set) == "pc_anq_elq_p"] <- "P"
+names(data_set)[names(data_set) == "pc_anq_elq_nb"] <- "Nb"
+names(data_set)[names(data_set) == "pc_anq_elq_ti"] <- "Ti"
+names(data_set)[names(data_set) == "pc_anq_elq_v"] <- "V"
+names(data_set)[names(data_set) == "pc_anq_elq_mo"] <- "Mo"
+names(data_set)[names(data_set) == "pc_anq_elq_cr"] <- "Cr"
+names(data_set)[names(data_set) == "pc_anq_elq_cu"] <- "Cu"
+names(data_set)[names(data_set) == "pc_anq_elq_ni"] <- "Ni"
+names(data_set)[names(data_set) == "pc_anq_elq_n"] <- "N"
+names(data_set)[names(data_set) == "pc_anq_elq_sb"] <- "Sb"
+names(data_set)[names(data_set) == "pc_anq_elq_ca"] <- "Ca"
+names(data_set)[names(data_set) == "pc_anq_elq_b"] <- "B"
+names(data_set)[names(data_set) == "pc_anq_elq_al"] <- "Al"
+
+names(data_set)[names(data_set) == "EP_PLACA_FINAL"] <- "EP_PLACA"
+names(data_set)[names(data_set) == "LG_PLACA_FINAL"] <- "LG_FINAL"
+names(data_set)[names(data_set) == "CM_PLACA_FINAL"] <- "CM_FINAL"
+
+names(data_set)[1]<-'CD_DEFEITO_PLACA'
+names(data_set)[names(data_set) == "LEAD_TIME"] <- "Leadtime"
+names(data_set)[names(data_set) == "pe_ling_infln"] <- "PeLingPed"
+names(data_set)[names(data_set) == "vl_incor_ust_2019"] <- "CustoLiga"
+names(data_set)[names(data_set) == "cd_pdcst_placa"] <- "PadCST"
+names(data_set)[names(data_set) == "nm_clien_abr"] <- "nm_clien_abr"
+
+
+data_set$evq_SuperCritico<-0
+evq<-c('026','224','028','029','083','058','059')
+for (temp_evq in evq){data_set$evq_SuperCritico<-ifelse(grepl(temp_evq,data_set$EVQ) | data_set$evq_SuperCritico==1,1,0)}
+
+data_set$evq_Critico<-0
+evq<-c('062','011','010','027','721')
+for (temp_evq in evq){data_set$evq_Critico<-ifelse(grepl(temp_evq,data_set$EVQ) | data_set$evq_Critico==1,1,0)}
+
+data_set$id_Dgrave<-0
+descl<-c('D02','QHE','P17','TG','TT','4IP','P06','S77')
+for (temp_descl in descl){data_set$id_Dgrave<-ifelse(grepl(temp_descl,data_set$CD_DEFEITO_PLACA) | data_set$id_Dgrave==1,1,0)}
+
+data_set$evq_ML<-ifelse(grepl('354',data_set$EVQ),1,0)
+data_set$evq_aqc<-ifelse(grepl('077',data_set$EVQ),1,0)
+data_set$evq_aqc300<-ifelse(grepl('177',data_set$EVQ),1,0)
+data_set$evq_MIX066<-ifelse(grepl('066',data_set$EVQ) & grepl('266',data_set$EVQ),1,0)
+data_set$evq_MIX166<-ifelse((grepl('166',data_set$EVQ) & grepl('266',data_set$EVQ)) | grepl('P17',data_set$CD_DEFEITO_PLACA) | grepl('QHE',data_set$CD_DEFEITO_PLACA) ,1,0)
+data_set$id_D05<-ifelse(grepl('D05',data_set$CD_DEFEITO_PLACA) | grepl('D03',data_set$CD_DEFEITO_PLACA) ,1,0)
+
+data_set$ID_FF<-ifelse(nchar(data_set$cq_ff_cqped_rep)>0,1,0)
+data_set$id_placa_venda<-ifelse(data_set$cd_lnaci_placa_tipo=='V',1,0)
+
+data_set$DeltaC<- ifelse(is.na(data_set$pc_anq_elq_c_pl_adj) | is.na(data_set$C),0,
+                         ifelse(data_set$cd_tipo_dtr_troca=='Sem Troca',abs(data_set$C-data_set$pc_anq_elq_c_pl_adj),0))
+
+data_set$DeltaMn<- ifelse(is.na(data_set$pc_anq_elq_mn_pl_adj) | is.na(data_set$Mn),0,
+                          ifelse(data_set$cd_tipo_dtr_troca=='Sem Troca',abs(data_set$Mn-data_set$pc_anq_elq_mn_pl_adj),0))
+
+data_set$DeltaTi<- ifelse(is.na(data_set$pc_anq_elq_ti_pl_adj) | is.na(data_set$Ti),0,
+                          ifelse(data_set$cd_tipo_dtr_troca=='Sem Troca',abs(data_set$Ti-data_set$pc_anq_elq_ti_pl_adj),0))
+
+data_set$DeltaNb<- ifelse(is.na(data_set$pc_anq_elq_nb_pl_adj) | is.na(data_set$Nb),0,
+                          ifelse(data_set$cd_tipo_dtr_troca=='Sem Troca',abs(data_set$Nb-data_set$pc_anq_elq_nb_pl_adj),0))
+
+data_set$DeltaSi<- ifelse(is.na(data_set$pc_anq_elq_si_pl_adj) | is.na(data_set$Si),0,
+                          ifelse(data_set$cd_tipo_dtr_troca=='Sem Troca',abs(data_set$Si-data_set$pc_anq_elq_si_pl_adj),0))
+
+#insere 0 para dados nulos
+for(i in 1:ncol(data_set)){data_set[is.na(data_set[,i]),i]<-0}
+
+
+#seleciona apenas dados numéricos
+TRAIN_VECTOR<- rownames(data.frame(which(sapply( data_set, class ) == 'numeric' )))
+TRAIN_VECTOR<-setdiff(TRAIN_VECTOR,TARGET)
+
+
+TRAIN_VECTOR<-setdiff(TRAIN_VECTOR,c("PE_GQB_PLACA","Leadtime","NO_SLAB","PeLingPed","evq_priorizado","Laminada"))
+
+#Retira amostra para teste (20%)
+random_splits<-runif(nrow(data_set))
+test_set<-data_set[random_splits<=0.2,]
+data_set<-data_set[random_splits>0.2,]
+
+
+#data_set<-rbind(sample_n(data_set[data_set[,TARGET]==0,],NROW(data_set[data_set[,TARGET]==1,])*1,replace=F),data_set[data_set[,TARGET]==1,])
+manual_group<-c('C;9','Mn;8','Si;5','Nb;5','Ti;6','Cu;3','Cr;3','Ni;2','Mo;2','B;2','P;3','V;2','Ca;2','EP_PLACA;3','LG_PLACA;3')
+data_set<-undersampling_byclusters(x=data_set,groupby=manual_group,TARGET=TARGET)
+
+#temp<-outliers_md(data_set,300,colunas=c('C','Mn','Ti','Nb','Si'),retorna='colunas')
+
+#Identificação e eliminação de multicolinearidade se houver, ponto de corte de 0.7
+correlationmatrix = cor(data_set[,setdiff(TRAIN_VECTOR,TARGET)])
+highlyCorrelated <- findCorrelation(as.matrix(correlationmatrix), cutoff=0.7,names=TRUE)
+TRAIN_VECTOR<-setdiff(TRAIN_VECTOR,highlyCorrelated)
+
+#Transforma a variável TARGET em fator, para que o modelo entenda que é para classificação
+dados_balanco<-cbind(freq=table(data_set[,TARGET]), perc=prop.table(table(data_set[,TARGET]))*100)
+data_set[,TARGET] <- factor(ifelse(data_set[,TARGET]==1, 'Y', 'N'))
+test_set[,TARGET] <- factor(ifelse(test_set[,TARGET]==1, 'Y', 'N'))
+print(dados_balanco)
+
+#----------------- Fitting Random Forest Classification to the Training set---------------------------------
+
+library(doParallel)
+cores <-5
+getDoParWorkers()
+cl <- makeCluster(cores)
+registerDoParallel(cores)
+#Executa o modelo de random forest
+dtini<-Sys.time()
+classifier <- randomForest(x = data_set[,TRAIN_VECTOR],y = data_set[,TARGET],mtry =7,ntree = 400)#,keep.forest=TRUE,importance=TRUE)
+dtfim<-Sys.time()
+qtde<-NROW(data_set)
+extra<-paste0(dtini,"~",dtfim," | n=",qtde)
+stopCluster(cl)
+
+#str(unlist(classifier$votes))
+
+# Predição dos dados de teste
+y_pred = predict(classifier, newdata = test_set,type="prob")
+nfold_check(ifelse(as.character(test_set[,TARGET])=="Y",1,0),y_pred[,"Y"],infoextra=extra, infoextra2=dados_balanco)
+
+
+#Confusion Matrix
+confusionMatrix(test_set[, TARGET], factor(ifelse(ifelse(y_pred[,1]>=0.45,1,0)==0, 'Y', 'N')))
+#nfold_validation(x=test_set,n_fold = 10,modelo_caret=classifier,TARGET=TARGET,sampling_tecnique_dsc = c('Vitor'), replace_cutoff = TRUE, choose_cutoff = 2)
+
+#Preparando a curva ROC
+library(ROCR)
+y_prob =predict(classifier,type = 'prob', newdata = test_set)
+forestpred = prediction(y_prob[,2], test_set[,TARGET])
+forestperf = performance(forestpred, 'tpr', 'fpr')
+plot(forestperf, main='ROC', colorize=T)
+auc = performance(forestpred, 'auc')
+slot(auc, 'y.values')
+
+# Para escolher o número de árvores (Hyperparâmetro ntree)
+par(mfrow=c(1,1))
+pdf('Numero_arvores.pdf')
+plot(classifier)
+dev.off()
+
+#Verificação da importancia das variáveis do modelo
+importance(classifier)
+pdf('ImportanciaRF.pdf')
+plot(varImpPlot(classifier))
+dev.off()
+
+##ACHAR MELHOR PARA (Hyperparâmetro mtry)
+tuneRF(data_set[,TRAIN_VECTOR],data_set[ , TARGET], stepFactor=1.5)
+
+#-----------------Recursive Feature Elimination-------------------------------
+library(doParallel)
+cores <-5
+getDoParWorkers()
+cl <- makeCluster(cores)
+registerDoParallel(cores)
+
+L=length(data_set[,TRAIN_VECTOR])
+results_rfe <- rfe(data_set[,TRAIN_VECTOR] ,as.factor(data_set[,TARGET]),rfeControl = rfeControl(functions=rfFuncs,  method="cv", number=5),
+                   sizes=ceiling(c(L*0.05,L*0.125,L*0.25,L*0.375,L*0.5,L*0.625,L*0.75,L*0.875,L*0.95)))
+var_predictors <-predictors(results_rfe)
+stopCluster(cl)
+
+print(var_predictors)
+print(results_rfe$results$Accuracy)
+TRAIN_VECTOR<-var_predictors
+
+
+#-------caret for random forest----------
+
+library(doParallel)
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores = cores)
+set.seed(123)
+control <- trainControl(method="repeatedcv",classProbs=TRUE, number=1,repeats=1,summaryFunction=twoClassSummary, allowParallel = FALSE)
+modelrf <- train(x=data_set[,TRAIN_VECTOR], y=data_set[,TARGET],method='rf',metric='ROC', tuneGrid=expand.grid(.mtry=c(6)),trControl=control,ntree=300)
+stopCluster(cores)
+plot(varImp(modelrf),main=modelrf$modelInfo$label)
+
+# Realizando a predição nos dados de teste
+y_pred <- predict(modelrf, newdata = test_set,type="prob")
+nfold_check(ifelse(as.character(test_set[,TARGET])=="Y",1,0),y_pred[,"Y"])
+
+#Confusion Matrix
+confusionMatrix(test_set[, TARGET], factor(ifelse(ifelse(y_pred[,1]>=0.6,1,0)==0, 'Y', 'N')))
+
+
+#-----------caret--------------
+
+
+# k-fold cross validation (caret)
+folds=3
+repeats=1
+PP <- c('center', 'scale')
+METRIC= 'ROC'
+Y <- data_set[,TARGET]
+trainControl <- trainControl(method='cv', number=folds, classProbs=TRUE, returnData=FALSE,                           
+                             savePredictions=FALSE, verboseIter=TRUE,search='random', allowParallel = TRUE,
+                             summaryFunction=twoClassSummary, index=createMultiFolds(Y, k=folds, times=repeats))
+
+#testa 9 tipos de modelos diferentes, os hyperparametros são testados no caret e o melhor resultado já é atribuído no modelo
+model1 <- train(x=data_set[,TRAIN_VECTOR], Y, method='glm', trControl=trainControl, metric = METRIC, family='binomial')
+model2 <- train(x=data_set[,TRAIN_VECTOR], Y, method='rf', trControl=trainControl, metric = METRIC, importance = TRUE,ntree=500,.mtry=7) #Random Forest
+model3 <- train(x=data_set[,TRAIN_VECTOR], Y, method='xgbTree', trControl=trainControl, metric = METRIC,preProcess=PP, importance = TRUE) #Extreme Gradiente Boosting  
+model4 <- train(x=data_set[,TRAIN_VECTOR], Y, method='gbm', trControl=trainControl, metric = METRIC) #Stochastic Gradient Boosting
+model5 <- train(x=data_set[,TRAIN_VECTOR], Y, method='nnet', trControl=trainControl,metric = METRIC,preProcess=PP, importance = TRUE,.size=3,maxit=1000,linout = FALSE)	
+model6 <- train(x=data_set[,TRAIN_VECTOR], Y, method='knn', trControl=trainControl, metric = METRIC,preProcess=PP, tuneGrid = expand.grid(k = c(3, 5, 7)))	
+model7 <- train(x=data_set[,TRAIN_VECTOR], Y, method='C5.0Tree', trControl=trainControl, metric = METRIC, importance = TRUE) #Decision Tree
+model8 <- train(x=data_set[,TRAIN_VECTOR], Y, method='naive_bayes', trControl=trainControl, metric = METRIC,preProcess=PP) #Naive Bayes
+model9 <- train(x=data_set[,TRAIN_VECTOR], Y, method='lda', trControl=trainControl, metric = METRIC,preProcess=PP, importance = TRUE)
+
+
+# Realizando a predição nos dados de teste
+y_pred <- predict(modelrf, newdata = test_set,type="prob")
+
+#Confusion Matrix
+confusionMatrix(test_set[, TARGET], factor(ifelse(ifelse(y_pred[,1]>=0.6,1,0)==0, 'Y', 'N')))
+
+Modelo <- model7
+# Predição dos dados de teste
+y_pred = predict(Modelo, newdata = test_set,type="prob")
+nfold_check(ifelse(as.character(test_set[,TARGET])=="Y",1,0),y_pred[,"Y"],infoextra="extra", infoextra2="dados_balanco")
+
+
+
+
+#cria uma lista com todos os modelos juntos
+all.models <- list(model1, model2, model3, model5, model6, model7,model8,model9)
+importance.models <- list(model1, model2, model3, model5, model7)
+
+#Trata a lista para poder extrair as informações que permitem montar os gráficos de comparação dos modelos
+names(all.models) <- sapply(all.models, function(x) x$method)
+names(importance.models) <- sapply(importance.models, function(x) x$method)
+sort(sapply(all.models, function(x) min(x$results$ROC))) #Accuracy
+
+# Resultado (precisamos passar um list de modelos treinados com Train)
+results <- resamples(all.models)
+importance.results <- resamples(importance.models)
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+Relevancia =bwplot(results, scales=scales)
+importance.Relevancia =bwplot(importance.results, scales=scales)
+
+#Comparação das métricas ROC de cada modelo
+pdf(paste('Model Comparation',1,".pdf",sep=""))
+plot(Relevancia)
+plot(importance.Relevancia)
+plot(splom(importance.results))
+dev.off()
+
+#Importância das variáveis
+pdf(paste('Importance',1,".pdf",sep=""))
+plot(varImp(model1),main=model1$modelInfo$label)
+plot(varImp(model2),main=model2$modelInfo$label)
+plot(varImp(model3),main=model3$modelInfo$label)
+plot(varImp(model5),main=model5$modelInfo$label)
+plot(varImp(model7),main=model7$modelInfo$label)
+dev.off()
+
+
+#saveRDS(modelrf, "modelo.rds")
+modelrf <- readRDS("modelo.rds")
+
